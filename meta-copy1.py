@@ -1,842 +1,633 @@
-#代码1
 import os
 os.environ["KERAS_BACKEND"] = "torch"  # 必须在导入 keras 前设置
-import random
-# =============================================================================
-# 全局随机种子设置（保持原有逻辑）
-# =============================================================================
-def set_all_seeds(seed=42):
-    import numpy as _np
-    import torch as _torch
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    random.seed(seed)
-    _np.random.seed(seed)
-    _torch.manual_seed(seed)
-    _torch.cuda.manual_seed_all(seed)
-    _torch.backends.cudnn.deterministic = True
-    _torch.backends.cudnn.benchmark = False
-set_all_seeds(42)  # 在导入其他库之前调用
-# =============================================================================
-# 统一参数配置类（参考代码2重构）
-# =============================================================================
-class ModelConfig:
-    """代码1参数配置类，所有参数集中管理"""
-    # 基础路径配置
-    SLOPE_OR_PT = 'pt'  # 'slope' 或 'pt'
-    SUB_DIR = '0000'
-    # 模型加载开关
-    MODEL_LOAD = True  # True=检查并加载已有模型（重置学习率），False=重新构建模型
-    # 数据加载配置
-    FILES_PER_BATCH = 0  # 0=一次性加载所有文件，>0=每次加载指定数量的文件
-    # 内存优化配置
-    CLEAR_CUDA_CACHE_EACH_EPOCH = True   # 是否每个epoch清理显存
-    SAVE_PREDICTION_HISTORY = False      # 是否保存预测历史（默认关闭防内存泄漏）
-    EVALUATION_BATCH_SIZE = 180008        # 评估时的batch size（可单独设置）
-    # 模型架构参数
-    EMBEDDING_SIZE = 228
-    DENSE_UNITS = [512, 256, 128, 64, 32]  # 保持原有参数，未添加16（避免改变运行结果）
-    ATTENTION_UNITS = 300
-    L2_REGULARIZATION = 0.001  # L2正则化系数
-    # 训练参数
-    TRAIN_BATCH_SIZE = 180008
-    LEARNING_RATE = 0.003
-    DROPOUT_RATE = 0.2
-    OPTIMIZER_CHOICE = 2  # 1=Adam, 2=RMSprop
-    EPOCHS = 35
-    PATIENCE_EARLY_STOPPING = 9
-    PATIENCE_LR_SCHEDULER = 3
-    LR_FACTOR = 0.3
-    # 损失函数参数（补充到配置类）
-    HUBER_LOSS_DELTA = 20
-    HUBER_NEGATIVE_WEIGHT = 1.5
-    HUBER_POSITIVE_WEIGHT = 0.5
-    # 优化器参数（补充到配置类）
-    ADAM_BETA1 = 0.8
-    ADAM_BETA2 = 0.99
-    ADAM_EPSILON = 1e-6
-    # 评估模式配置
-    SCALER_SAVE_DIR = "scalers"
-    LABEL_ENCODER_SAVE_NAME = {"user": "user_le.pkl", "item": "item_le.pkl"}
-# =============================================================================
-# 导入依赖库（保持原有顺序）
-# =============================================================================
-import torch
 import sys
 import glob
-import gc
-import logging
-import joblib
-import keras
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import GroupShuffleSplit
+import torch
+import gc
+import logging
+from typing import List, Tuple, Dict, Optional
+import shutil
+from datetime import datetime
+import joblib
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from keras.models import Model, load_model
-from keras.layers import (
-    Input, Flatten, Dense, Dropout, Multiply, Concatenate, BatchNormalization
-)
-from keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
-from keras.optimizers import Adam, RMSprop
-from keras.metrics import MeanAbsoluteError
-from keras.losses import Huber, log_cosh
-from keras.utils import Sequence
-from keras.regularizers import l2
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-from keras.initializers import HeUniform
-# ======================== 日志与字体配置（整合代码2） ========================
+import keras
+# =============================================================================
+# 初始化logger（解决NameError）
+# =============================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [FACTORY] %(levelname)s: %(message)s"
 )
-logger = logging.getLogger(__name__)
-def setup_chinese_font():
-    """自动查找并设置中文字体"""
-    # Windows 常见中文字体
-    chinese_fonts = ['SimHei', 'Microsoft YaHei', 'SimSun', 'KaiTi']
-    # 查找系统中已安装的中文字体
-    available_fonts = [f.name for f in fm.fontManager.ttflist]
-    font_found = None
-    for font in chinese_fonts:
-        if font in available_fonts:
-            font_found = font
-            break
-    if font_found:
-        plt.rcParams['font.sans-serif'] = [font_found]
-        logger.info(f"已设置中文字体: {font_found}")
-    else:
-        logger.warning("未找到常见中文字体，图表可能无法正确显示中文")
-        logger.warning("建议安装 SimHei 或 Microsoft YaHei 字体")
-    # 解决负号显示问题
-    plt.rcParams['axes.unicode_minus'] = False
-# 初始化中文字体
-setup_chinese_font()
-# ======================== 自定义显存清理回调（代码1） ========================
-class ClearCacheCallback(Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        if ModelConfig.CLEAR_CUDA_CACHE_EACH_EPOCH:
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            print(f"\nEpoch {epoch+1}: 清理显存完成")
-# ======================== 新增：CSV日志回调（适配工厂模式） ========================
-class CSVHistoryLRCallback(Callback):
+logger = logging.getLogger("factory_train_final")
+# =============================================================================
+# 修复：替换 __file__ 路径导入方式（适配交互式环境和脚本运行）
+# =============================================================================
+current_dir = os.getcwd()
+sys.path.append(current_dir)
+logger.info(f"已添加当前目录到系统路径：{current_dir}")
+# 验证 deeptrain.py 是否存在
+deeptrain_path = os.path.join(current_dir, "deeptrain.py")
+if not os.path.exists(deeptrain_path):
+    raise FileNotFoundError(f"未找到 deeptrain.py，请确保它与当前文件在同一目录：{current_dir}")
+# 导入 deeptrain.py 中的核心函数和配置
+from deeptrain1 import (
+    ModelConfig, set_all_seeds, load_or_fit_label_encoders, preprocess_data_deepcrossing,
+    UpdatedDeepCrossingDataGenerator, build_model, train_model, evaluate_predictions,
+    get_data_paths, concat_parquet_files, huber_loss, evaluate_test_folder
+)
+# =============================================================================
+# 配置参数（按需调整）
+# =============================================================================
+class FactoryConfig:
+    SELECTED_FOLDER_INDEXES = [36,37,38,39,40,41,42,43]
+    #SELECTED_FOLDER_INDEXES = [33,34, 35,36,37,38,39,40,41,42,43] # 目标文件夹索引（可修改为其他索引如53、363）
+    CANDIDATE_COUNT = 50        # 每组候选训练数据数量
+    TIME_WINDOW_KEYS = ["1130", "1500"]  # 支持的时间窗口类型（与selected_folder文件名匹配）
+    FACTORY_CACHE_DIR = "pt/factory_cache"  # 聚合特征和索引存储目录
+    INDEX_CSV_PATH = os.path.join(FACTORY_CACHE_DIR, "offline_enum_index.csv")  # 评估结果索引文件
+    ONE_HOT_MAP = {
+        "systematic": [1, 0, 0],
+        "sliding": [0, 1, 0],
+        "topk": [0, 0, 1]
+    }  # 候选选择方案的one-hot编码
+    SEED = 42  # 全局随机种子（与deeptrain保持一致）
+# 设置全局随机种子（确保结果可复现）
+set_all_seeds(FactoryConfig.SEED)
+# =============================================================================
+# 工具函数：文件夹与时间处理
+# =============================================================================
+def normalize_factory_features(feat_df: pd.DataFrame):
     """
-    将每个 epoch 的训练数据写入 CSV 文件
+    分开处理全量数据和候选数据：
+    - 第一行（全量数据，user_id）：保持原始值
+    - 后续行（候选数据，item_id）：归一化
     """
-    def __init__(self, csv_path, run_id=None):
-        super().__init__()
-        self.csv_path = csv_path
-        self.run_id = run_id if run_id is not None else int(pd.Timestamp.now().timestamp())
-        self._header_written = os.path.exists(csv_path)
-
-    def on_epoch_end(self, epoch, logs=None):
-        if logs is None:
-            logs = {}
-        
-        # 获取当前学习率
-        try:
-            lr = float(self.model.optimizer.learning_rate)
-        except:
-            lr = float('nan')
-            
-        row = {
-            'run_id': self.run_id,
-            'epoch': epoch + 1,
-            'learning_rate': lr,
-            'timestamp': pd.Timestamp.now().isoformat(),
-            'loss': logs.get('loss', float('nan')),
-            'val_loss': logs.get('val_loss', float('nan')),
-            'mean_absolute_error': logs.get('mean_absolute_error', float('nan')),
-            'val_mean_absolute_error': logs.get('val_mean_absolute_error', float('nan'))
-        }
-        
-        df = pd.DataFrame([row])
-        
-        # 写入 CSV
-        if not self._header_written:
-            df.to_csv(self.csv_path, index=False, mode='w')
-            self._header_written = True
-        else:
-            df.to_csv(self.csv_path, index=False, mode='a', header=False)
-            
-        logger.info(f"Epoch {epoch+1} - Run ID: {self.run_id}, LR: {lr:.6f}, Loss: {logs.get('loss'):.4f}, Val Loss: {logs.get('val_loss', 'N/A')}")
-
-# ======================== 损失函数（代码1，适配ModelConfig） ========================
-def huber_loss(y_true, y_pred):
-    delta = ModelConfig.HUBER_LOSS_DELTA
-    error = y_true - y_pred
-    abs_error = keras.ops.abs(error)
-    quadratic = keras.ops.minimum(abs_error, delta)
-    linear = abs_error - quadratic
-    base_loss = 0.5 * keras.ops.square(quadratic) + delta * linear
-    weights = keras.ops.where(
-        error < 0,
-        ModelConfig.HUBER_NEGATIVE_WEIGHT,
-        ModelConfig.HUBER_POSITIVE_WEIGHT
-    )
-    return keras.ops.mean(base_loss * weights)
-# ======================== 工具函数（整合代码1+代码2，适配ModelConfig） ========================
-def get_data_paths(slopeorpt=None, sub_dir=None):
-    """统一数据路径获取（兼容代码1和代码2）"""
-    # 优先使用传入参数，无则使用配置类默认值
-    slopeorpt = slopeorpt or ModelConfig.SLOPE_OR_PT
-    sub_dir = sub_dir or ModelConfig.SUB_DIR
-    return {
-        "INTER_DATA_DIR": f"{slopeorpt}/inter_csv1/{sub_dir}",
-        "NEW_INTER_DATA_DIR": f"{slopeorpt}/inter_csv1/{sub_dir}/new",
-        "USER_DATA_FILE": f"{slopeorpt}/user1.parquet",
-        "ITEM_DATA_FILE": f"{slopeorpt}/item1.parquet",
-        "NEW_USER_DATA_FILE": f"{slopeorpt}/neuser1.parquet",
-        "NEW_ITEM_DATA_FILE": f"{slopeorpt}/neitem1.parquet"
-    }
-def load_label_encoders(slopeorpt=None, sub_dir=None):
-    """代码1原函数（兼容评估模式，适配ModelConfig）"""
-    slopeorpt = slopeorpt or ModelConfig.SLOPE_OR_PT
-    sub_dir = sub_dir or ModelConfig.SUB_DIR
-    user_le_path = os.path.join(slopeorpt, ModelConfig.LABEL_ENCODER_SAVE_NAME["user"])
-    item_le_path = os.path.join(slopeorpt, ModelConfig.LABEL_ENCODER_SAVE_NAME["item"])
-    if os.path.exists(user_le_path) and os.path.exists(item_le_path):
-        user_le = joblib.load(user_le_path)
-        item_le = joblib.load(item_le_path)
+    save_path = os.path.join(FactoryConfig.FACTORY_CACHE_DIR, "factory_scaler.pkl")
+    # 归一化列（0~325 + 328）
+    normalize_cols = [f"feat_{i}" for i in range(326)] + ["feat_328"]
+    keep_cols = [f"feat_{i}" for i in range(326, 328)] + [f"feat_{i}" for i in range(329, 332)]
+    # 分离全量数据（第一行）和候选数据（其余行）
+    full_row = feat_df.iloc[[0]].copy()
+    candidate_rows = feat_df.iloc[1:].copy()
+    # 初始化或加载Scaler
+    if os.path.exists(save_path):
+        scaler = joblib.load(save_path)
     else:
-        data_paths = get_data_paths(slopeorpt, sub_dir) 
-        user_df = pd.read_parquet(data_paths["USER_DATA_FILE"])
-        item_df = pd.read_parquet(data_paths["ITEM_DATA_FILE"])
-        if os.path.exists(data_paths["NEW_USER_DATA_FILE"]):
-            new_user_df = pd.read_parquet(data_paths["NEW_USER_DATA_FILE"])
-            user_df = pd.concat([user_df, new_user_df], ignore_index=True)
-        if os.path.exists(data_paths["NEW_ITEM_DATA_FILE"]):
-            new_item_df = pd.read_parquet(data_paths["NEW_ITEM_DATA_FILE"])
-            item_df = pd.concat([item_df, new_item_df], ignore_index=True)
-        user_le = LabelEncoder()
-        item_le = LabelEncoder()
-        user_le.fit(user_df['user_id'])
-        item_le.fit(item_df['item_id'])
-        joblib.dump(user_le, user_le_path)
-        joblib.dump(item_le, item_le_path)
-    return user_le, item_le
-def load_or_fit_label_encoders(slopeorpt=None, sub_dir=None):
-    """评估模式专用（确保编码器已存在，适配ModelConfig）"""
-    slopeorpt = slopeorpt or ModelConfig.SLOPE_OR_PT
-    sub_dir = sub_dir or ModelConfig.SUB_DIR
-    user_le_path = os.path.join(slopeorpt, ModelConfig.LABEL_ENCODER_SAVE_NAME["user"])
-    item_le_path = os.path.join(slopeorpt, ModelConfig.LABEL_ENCODER_SAVE_NAME["item"])
-    if not (os.path.exists(user_le_path) and os.path.exists(item_le_path)):
-        logger.error(f"未找到已保存的 LabelEncoder，请先运行训练: {user_le_path}, {item_le_path}")
-        sys.exit(1)
-    user_le = joblib.load(user_le_path)
-    item_le = joblib.load(item_le_path)
-    logger.info("已加载已有的 LabelEncoder")
-    return user_le, item_le
-def load_interaction_data(slopeorpt=None, sub_dir=None, selected_folder=None):
-    """代码1原函数：加载copy文件夹数据，适配ModelConfig"""
-    slopeorpt = slopeorpt or ModelConfig.SLOPE_OR_PT
-    sub_dir = sub_dir or ModelConfig.SUB_DIR
-    data_paths = get_data_paths(slopeorpt, sub_dir)
-    folder_path = os.path.join(data_paths["INTER_DATA_DIR"], selected_folder)
-    folder_path = os.path.join(folder_path, 'copy')
-    # 获取所有parquet文件
-    parquet_files = glob.glob(f"{folder_path}/*.parquet")
-    all_parquet_files = parquet_files
-    # 根据FILES_PER_BATCH参数确定批次大小
-    batch_size = ModelConfig.FILES_PER_BATCH if ModelConfig.FILES_PER_BATCH > 0 else len(parquet_files)
-    print(f"Batch size (files): {batch_size}")
-    # 计算总行数
-    total_rows = 0
-    for parquet_file in parquet_files:
-        df_temp = pd.read_parquet(parquet_file)
-        total_rows += len(df_temp)
-    # 分批加载
-    for i in range(0, len(parquet_files), batch_size):
-        batch_files = parquet_files[i:i + batch_size]
-        inter_df = pd.DataFrame()
-        for parquet_file in batch_files:
-            chunk = pd.read_parquet(parquet_file)
-            inter_df = pd.concat([inter_df, chunk])
-        yield inter_df, total_rows
-def concat_parquet_files(folder_path, files_per_batch=None):
-    """代码2函数：加载test文件夹数据，适配ModelConfig"""
-    files_per_batch = files_per_batch or ModelConfig.FILES_PER_BATCH
-    parquet_files = sorted(glob.glob(os.path.join(folder_path, "*.parquet")))
-    if not parquet_files:
-        return pd.DataFrame()
-    if files_per_batch == 0:
-        list_dfs = [pd.read_parquet(p) for p in parquet_files]
-        return pd.concat(list_dfs, ignore_index=True)
-    list_dfs = []
-    for start in range(0, len(parquet_files), files_per_batch):
-        batch = parquet_files[start:start + files_per_batch]
-        for p in batch:
-            list_dfs.append(pd.read_parquet(p))
-    return pd.concat(list_dfs, ignore_index=True)
-def parse_feature(x):
-    """代码1原函数：解析特征"""
-    if isinstance(x, str):
-        return np.fromstring(x.strip("[]"), sep=' ', dtype=np.float32)
-    return x
-def fast_parse_feature_series(series):
-    """代码2函数：快速解析特征序列"""
-    def _parse_one(x):
-        if isinstance(x, (np.ndarray, list)):
-            return np.array(x, dtype=np.float32)
-        if isinstance(x, str):
-            s = x.strip()
-            if s.startswith("[") and s.endswith("]"):
-                s = s[1:-1]
-            if "," in s:
-                parts = s.replace(",", " ").split()
-            else:
-                parts = s.split()
-            return np.array([float(v) for v in parts], dtype=np.float32)
-        return np.array([], dtype=np.float32)
-    return series.map(_parse_one)
-def batch_normalize_features(df, feature_columns, scalers_dict, scope_key=None):
-    """统一批次归一化函数（兼容代码1和代码2）"""
-    if scope_key is None:
-        # 代码1原逻辑
-        for feature in feature_columns:
-            if feature in scalers_dict:
-                scaler = scalers_dict[feature]
-                feature_data = np.stack(df[feature].values)
-                if feature_data.shape[1] == scaler.n_features_in_:
-                    transformed = scaler.transform(feature_data)
-                else:
-                    transformed = np.zeros((len(df), scaler.n_features_in_))
-                df[feature] = list(transformed)
-    else:
-        # 代码2评估逻辑
-        for feature in feature_columns:
-            scaler = scalers_dict[scope_key].get(feature, None)
-            if scaler is None:
-                continue
-            feature_data = np.stack(df[feature].values)
-            if feature_data.shape[1] == scaler.n_features_in_:
-                transformed = scaler.transform(feature_data)
-            else:
-                transformed = np.zeros((len(df), scaler.n_features_in_), dtype=np.float32)
-            df[feature] = list(transformed)
-    return df
-def preprocess_data_deepcrossing(inter_df, slopeorpt=None, sub_dir=None):
-    """代码1原函数：预处理copy文件夹数据，适配ModelConfig"""
-    slopeorpt = slopeorpt or ModelConfig.SLOPE_OR_PT
-    sub_dir = sub_dir or ModelConfig.SUB_DIR
-    data_paths = get_data_paths(slopeorpt, sub_dir)
-    user_df = pd.read_parquet(data_paths["USER_DATA_FILE"])
-    item_df = pd.read_parquet(data_paths["ITEM_DATA_FILE"])
-    # 标签编码
-    user_le = LabelEncoder()
-    item_le = LabelEncoder()
-    user_df['user_id'] = user_le.fit_transform(user_df['user_id'])
-    item_df['item_id'] = item_le.fit_transform(item_df['item_id'])
-    inter_df['user_id'] = user_le.transform(inter_df['user_id'])
-    inter_df['item_id'] = item_le.transform(inter_df['item_id'])
-    # 分割数据集
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.1, random_state=32)
-    train_idx, test_idx = next(gss.split(inter_df, groups=inter_df['user_id']))
-    train_df = inter_df.iloc[train_idx]
-    test_df = inter_df.iloc[test_idx]
-    # 获取训练集的用户和商品范围
-    train_user_ids = train_df['user_id'].unique()
-    train_item_ids = train_df['item_id'].unique()
-    # 用户特征归一化（仅使用训练用户数据）
-    user_features = user_df.columns[1:]
-    for col in user_features:
-        user_df[col] = user_df[col].apply(parse_feature)
-    # 预解析商品特征
-    item_features = item_df.columns[1:]
-    for col in item_features:
-        item_df[col] = item_df[col].apply(parse_feature)
-    # 用户特征归一化（批量处理）
-    user_scalers = {}
-    for feature in user_features:
-        # 提取训练用户的特征数据
-        train_mask = user_df['user_id'].isin(train_user_ids)
-        train_data = np.stack(user_df.loc[train_mask, feature].values)
-        if len(train_data) > 0:
-            scaler = StandardScaler()
-            scaler.fit(train_data)
-            user_scalers[feature] = scaler
-    # 批量归一化所有用户特征
-    user_df = batch_normalize_features(user_df, user_features, user_scalers)
-    # 商品特征归一化（批量处理）
-    item_scalers = {}
-    for feature in item_features:
-        # 提取训练商品的特征数据
-        train_mask = item_df['item_id'].isin(train_item_ids)
-        train_data = np.stack(item_df.loc[train_mask, feature].values)
-        if len(train_data) > 0:
-            scaler = StandardScaler()
-            scaler.fit(train_data)
-            item_scalers[feature] = scaler
-    # 批量归一化所有商品特征
-    item_df = batch_normalize_features(item_df, item_features, item_scalers)
-    # 交互特征归一化
-    interaction_features = [col for col in inter_df.columns if col not in ['user_id', 'item_id', 'rating']]
-    if interaction_features:
-        inter_scaler = StandardScaler()
-        inter_scaler.fit(train_df[interaction_features])
-        train_df[interaction_features] = inter_scaler.transform(train_df[interaction_features])
-        test_df[interaction_features] = inter_scaler.transform(test_df[interaction_features])
-    else:
-        inter_scaler = None
-        print("警告: 未找到交互特征")
-    # 合并处理后的数据
-    inter_df = pd.concat([train_df, test_df])
-    # 保存归一化器
-    scalers_dir = os.path.join(slopeorpt, ModelConfig.SCALER_SAVE_DIR, sub_dir)
-    os.makedirs(scalers_dir, exist_ok=True)
-    # 保存用户/商品/交互特征归一化器（兼容代码2）
-    scalers_dict = {
-        "user": user_scalers,
-        "item": item_scalers,
-        "inter": inter_scaler,
-        "inter_features": interaction_features
-    }
-    joblib.dump(user_scalers, os.path.join(scalers_dir, "user_scalers.pkl"))
-    joblib.dump(item_scalers, os.path.join(scalers_dir, "item_scalers.pkl"))
-    if inter_scaler is not None:
-        joblib.dump(inter_scaler, os.path.join(scalers_dir, "inter_scaler.pkl"))
-        joblib.dump(interaction_features, os.path.join(scalers_dir, "inter_feature_names.pkl"))
-        joblib.dump(scalers_dict, os.path.join(scalers_dir, "scalers_dict.pkl"))  # 代码2需要的整合scaler
-        print(f"保存了 {len(interaction_features)} 个交互特征名称")
-    else:
-        print("未保存交互特征归一化器，因为没有交互特征")
-    # 保存标签编码器
-    joblib.dump(user_le, os.path.join(slopeorpt, ModelConfig.LABEL_ENCODER_SAVE_NAME["user"]))
-    joblib.dump(item_le, os.path.join(slopeorpt, ModelConfig.LABEL_ENCODER_SAVE_NAME["item"]))
-    # 打印数据统计信息
-    print("\n=== 数据预处理统计 ===")
-    print(f"总交互数: {len(inter_df)}")
-    print(f"训练集大小: {len(train_df)}")
-    print(f"测试集大小: {len(test_df)}")
-    print(f"用户数: {len(user_le.classes_)}")
-    print(f"商品数: {len(item_le.classes_)}")
-    print(f"用户特征数: {len(user_features)}")
-    print(f"商品特征数: {len(item_features)}")
-    print(f"交互特征数: {len(interaction_features) if interaction_features else 0}")
-    return inter_df, user_df, item_df, user_le, item_le, train_idx, test_idx
-# ======================== 数据生成器（整合代码1+代码2，适配ModelConfig） ========================
-class UpdatedDeepCrossingDataGenerator(Sequence):
-    def __init__(self, inter_df, user_df, item_df, batch_size=None):
-        self.batch_size = batch_size or ModelConfig.TRAIN_BATCH_SIZE
-        self.inter_df = inter_df.reset_index(drop=True)
-        self.user_df = user_df
-        self.item_df = item_df
-        # 自动推断特征列（去掉 id 列）
-        self.user_features = [c for c in user_df.columns if c != 'user_id']
-        self.item_features = [c for c in item_df.columns if c != 'item_id']
-        self.interaction_features = [c for c in inter_df.columns if c not in ['user_id', 'item_id', 'rating']]
-        # 存储用户ID和物品ID用于评估
-        self.user_ids = self.inter_df['user_id'].values if not self.inter_df.empty else np.array([], dtype=np.int32)
-        self.item_ids = self.inter_df['item_id'].values if not self.inter_df.empty else np.array([], dtype=np.int32)
-        # 构建特征字典（保证每个 user_id/item_id 对应一个拼接后的向量）
-        self.user_feature_dict = {}
-        if len(user_df) > 0:
-            for user_id, row in user_df.set_index('user_id').iterrows():
-                self.user_feature_dict[user_id] = np.hstack([row[feat] for feat in self.user_features])
-        self.item_feature_dict = {}
-        if len(item_df) > 0:
-            for item_id, row in item_df.set_index('item_id').iterrows():
-                self.item_feature_dict[item_id] = np.hstack([row[feat] for feat in self.item_features])
-        # 记录维度，方便调试
-        self.user_dim = len(next(iter(self.user_feature_dict.values()))) if len(self.user_feature_dict) > 0 else 0
-        self.item_dim = len(next(iter(self.item_feature_dict.values()))) if len(self.item_feature_dict) > 0 else 0
-        self.inter_dim = len(self.interaction_features)
-        print(f"[DataGenerator] user_dim={self.user_dim}, item_dim={self.item_dim}, inter_dim={self.inter_dim}")
-    def __len__(self):
-        if self.inter_df.empty:
-            return 0
-        return int(np.ceil(len(self.inter_df) / float(self.batch_size)))
-    def __getitem__(self, idx):
-        batch_inter = self.inter_df.iloc[idx * self.batch_size:(idx + 1) * self.batch_size]
-        user_ids = batch_inter['user_id'].values
-        item_ids = batch_inter['item_id'].values
-        # 提取特征（兼容代码2的空值处理）
-        user_features = np.array([
-            self.user_feature_dict.get(uid, np.zeros(self.user_dim, dtype=np.float32)) 
-            for uid in user_ids
-        ], dtype=np.float32)
-        item_features = np.array([
-            self.item_feature_dict.get(iid, np.zeros(self.item_dim, dtype=np.float32)) 
-            for iid in item_ids
-        ], dtype=np.float32)
-        inter_features = batch_inter[self.interaction_features].values.astype(np.float32) if len(self.interaction_features) > 0 else np.zeros((len(batch_inter), 0), dtype=np.float32)
-        ratings = batch_inter['rating'].values.astype(np.float32)
-        return (user_features, item_features, inter_features), ratings
-    def get_input_dims(self):
-        """代码2需要的维度获取函数"""
-        return self.user_dim, self.item_dim, self.inter_dim
-# ======================== 模型构建与训练（代码1，适配ModelConfig） ========================
-def build_model(user_dim, item_dim, inter_dim):
-
-    # 定义输入层
-    user_features_input = Input(shape=(user_dim,), name='user_features')
-    item_features_input = Input(shape=(item_dim,), name='item_features')
-    interaction_features_input = Input(shape=(inter_dim,), name='interaction_features')
-    # 特征处理
-    user_embedding = Dense(ModelConfig.EMBEDDING_SIZE, activation='relu')(user_features_input)
-    user_embedding = Dense(ModelConfig.EMBEDDING_SIZE, activation='relu')(user_embedding)
-    item_embedding = Dense(ModelConfig.EMBEDDING_SIZE, activation='relu')(item_features_input)
-    item_embedding = Dense(ModelConfig.EMBEDDING_SIZE, activation='relu')(item_embedding)
-    interaction_embedding = Dense(ModelConfig.EMBEDDING_SIZE, activation='relu')(interaction_features_input)
-    interaction_embedding = Dense(ModelConfig.EMBEDDING_SIZE, activation='relu')(interaction_embedding)
-    # 注意力机制
-    user_combined = Concatenate(name='user_combined_embedding')([Flatten()(user_embedding), user_embedding, interaction_embedding])
-    item_combined = Concatenate(name='item_combined_embedding')([Flatten()(item_embedding), item_embedding, interaction_embedding])
-    attention_input = Multiply(name='attention_multiply')([user_combined, item_combined])
-    attention_vector = Dense(ModelConfig.ATTENTION_UNITS, activation='linear', name='attention_dense_linear')(attention_input)
-    attention_vector = Dense(ModelConfig.ATTENTION_UNITS, activation='sigmoid', name='attention_dense_sigmoid')(attention_vector)
-    # 合并特征
-    mf_vector = Concatenate()([user_embedding, item_embedding, interaction_embedding, attention_vector])
-    mlp_vector = Concatenate()([user_features_input, item_features_input, interaction_features_input])
-    # MLP层（使用统一的L2正则化参数）
-    for units in ModelConfig.DENSE_UNITS:
-        mlp_vector = Dense(units, activation='relu', kernel_regularizer=l2(ModelConfig.L2_REGULARIZATION))(mlp_vector)
-        mlp_vector = BatchNormalization()(mlp_vector)
-        mlp_vector = Dropout(ModelConfig.DROPOUT_RATE)(mlp_vector)
-    # 最终预测
-    concatenated = Concatenate()([mf_vector, mlp_vector])
-    predictions = Dense(1, activation='linear')(concatenated)
-    # 定义模型
-    model = Model(inputs=[user_features_input, item_features_input, interaction_features_input], outputs=predictions)
-    return model
-def train_model(model, train_generator, val_generator, user_le, item_le, 
-                csv_log_path=None, run_id=None):
+        scaler = RobustScaler()
+        scaler.fit(candidate_rows[normalize_cols])
+        joblib.dump(scaler, save_path)
+    # 对候选数据归一化
+    candidate_rows[normalize_cols] = scaler.transform(candidate_rows[normalize_cols])
+    # 合并回去
+    feat_df = pd.concat([full_row, candidate_rows], axis=0)
+    logger.info(f"候选数据归一化完成 (RobustScaler)，全量数据保持原始值，参数文件: {save_path}")
+    return feat_df
+def extract_folder_datetime(folder_name: str) -> Tuple[str, str]:
     """
-    代码1训练函数（已适配工厂模式参数）：
-    - 新增 csv_log_path, run_id 参数
-    - 新增 val_generator 参数，若提供则优先作为验证集使用
+    修复版：直接从文件夹名截取，保持原始位数 (如 1500, 0940)
+    返回：(datetime_str: "2025-1-7-1500", time_window: "1500")
     """
-    # 1. 确定验证数据和监控指标
-    # 如果传入了独立的验证集(val_generator)，则使用它；否则回退到代码1原有逻辑(使用test_generator作为验证集)
-
-    monitor_metric = 'val_loss' if val_generator is not None else 'loss'
-    
-    # 2. 选择优化器
-    if ModelConfig.OPTIMIZER_CHOICE == 1:
-        optimizer = Adam(
-            learning_rate=ModelConfig.LEARNING_RATE, 
-            beta_1=ModelConfig.ADAM_BETA1, 
-            beta_2=ModelConfig.ADAM_BETA2, 
-            epsilon=ModelConfig.ADAM_EPSILON
-        )
-    elif ModelConfig.OPTIMIZER_CHOICE == 2:
-        optimizer = RMSprop(learning_rate=ModelConfig.LEARNING_RATE)
-    else:
-        raise ValueError("Invalid optimizer choice. Please choose 1 for Adam or 2 for RMSprop.")
-
-    # 3. 学习率调度器 (使用动态确定的监控指标)
-    lr_scheduler = ReduceLROnPlateau(
-        monitor=monitor_metric, 
-        factor=ModelConfig.LR_FACTOR, 
-        patience=ModelConfig.PATIENCE_LR_SCHEDULER
-    )
-
-    # 使用自定义 huber_loss
-    model.compile(optimizer=optimizer, loss=huber_loss, metrics=[MeanAbsoluteError()])
-
-    # 4. 构建回调列表
-    callbacks = [
-        EarlyStopping(
-            monitor=monitor_metric, 
-            patience=ModelConfig.PATIENCE_EARLY_STOPPING, 
-            restore_best_weights=True
-        ),
-        lr_scheduler
-    ]
-
-    # 根据参数添加显存清理回调
-    if ModelConfig.CLEAR_CUDA_CACHE_EACH_EPOCH:
-        callbacks.append(ClearCacheCallback())
-    
-    # 新增：如果指定了 CSV 日志路径，添加回调
-    if csv_log_path:
-        # 确保目录存在
-        os.makedirs(os.path.dirname(csv_log_path), exist_ok=True)
-        callbacks.append(CSVHistoryLRCallback(csv_path=csv_log_path, run_id=run_id))
-
-    # 5. 训练模型
-    history = model.fit(
-        train_generator,
-        validation_data=val_generator,
-        epochs=ModelConfig.EPOCHS,
-        callbacks=callbacks,
-        verbose=1
-    )
-    return model, history
-
-# ======================== 评估函数（整合代码1+代码2，适配ModelConfig） ========================
-def evaluate_predictions(test_generator, model, user_le, item_le):
-    """统一评估预测函数（兼容代码1和代码2）"""
-    if len(test_generator) == 0:
-        return pd.DataFrame(columns=['user_id', 'item_id', 'prediction', 'true_rating'])
-    logger.info("开始生成预测...")
-    # 使用单独的评估batch size
-    predictions = model.predict(test_generator, batch_size=ModelConfig.EVALUATION_BATCH_SIZE, verbose=1)
-    start_idx = 0
-    user_ids = []
-    item_ids = []
-    true_ratings = []
-    for i in range(len(test_generator)):
-        batch = test_generator[i]
-        batch_size = len(batch[1])
-        end_idx = start_idx + batch_size
-        # 从生成器的属性中提取当前批次的ID
-        user_ids.extend(test_generator.user_ids[start_idx:end_idx])
-        item_ids.extend(test_generator.item_ids[start_idx:end_idx])
-        # 获取当前批次的真实评分
-        true_ratings.extend(batch[1])
-        start_idx = end_idx
-    user_ids = np.array(user_ids)
-    item_ids = np.array(item_ids)
-    true_ratings = np.array(true_ratings)
-    df = pd.DataFrame({
-        'user_id': user_le.inverse_transform(user_ids),
-        'item_id': item_le.inverse_transform(item_ids),
-        'prediction': predictions.flatten(),
-        'true_rating': true_ratings
-    })
-    logger.info(f"预测完成，共生成 {len(df)} 条结果")
-    return df
-def plot_top_n_predictions(df, n=5):
-    """统一可视化函数（兼容代码1和代码2）"""
-    if df.empty:
-        logger.info("没有预测结果可视化（df 为空）。")
-        return
-    df_sorted = df.sort_values(by=['user_id', 'prediction'], ascending=[True, False])
-    top_n_df = df_sorted.groupby('user_id').head(n)
-    for user_id, group in top_n_df.groupby('user_id'):
-        print(f"User ID: {user_id}")
-        for i, row in group.iterrows():
-            print(f"  Item ID: {row['item_id']}, Predicted Rating: {row['prediction']:.4f}, True Rating: {row['true_rating']:.4f}")
-        print()
-    colors = plt.cm.rainbow(np.linspace(0, 1, len(df['user_id'].unique())))
-    color_dict = dict(zip(df['user_id'].unique(), colors))
-    plt.figure(figsize=(12, 10))
-    for user_id in df['user_id'].unique():
-        user_df = top_n_df[top_n_df['user_id'] == user_id]
-        plt.scatter(user_df['true_rating'], user_df['prediction'], alpha=0.5, color=color_dict[user_id], label=user_id)
-    plt.title('Actual vs Predicted Ratings for Top N Items')
-    plt.xlabel('Actual Ratings')
-    plt.ylabel('Predicted Ratings')
-    plt.legend(title='User ID', bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.show()
-def evaluate_test_folder(selected_folder):
-    """代码2核心逻辑：评估test文件夹数据，适配ModelConfig"""
-    logger.info("=" * 60)
-    logger.info("开始评估 test 文件夹数据")
-    logger.info("=" * 60)
-    evaluation = None
-    df = pd.DataFrame()
-    # 1. 加载 LabelEncoder
-    logger.info("步骤1: 加载 LabelEncoder...")
-    user_le, item_le = load_or_fit_label_encoders()
-    # 2. 加载测试数据
-    logger.info("步骤2: 加载test文件夹数据...")
-    data_paths = get_data_paths()
-    folder_base = os.path.join(data_paths["INTER_DATA_DIR"], selected_folder)
-    test_folder = os.path.join(folder_base, 'test')
-    if not os.path.exists(test_folder):
-        logger.error(f"测试文件夹不存在: {test_folder}")
-        return
-    test_inter_df = concat_parquet_files(test_folder)
-    if test_inter_df.empty:
-        logger.error("test文件夹数据为空，无法评估")
-        return
-    logger.info(f"成功加载test数据，共 {len(test_inter_df)} 条交互记录")
-    # 3. 加载用户和物品特征数据
-    logger.info("步骤3: 加载用户和物品特征数据...")
-    user_df = pd.read_parquet(data_paths["USER_DATA_FILE"])
-    item_df = pd.read_parquet(data_paths["ITEM_DATA_FILE"])
-    # 4. 标签编码
-    logger.info("步骤4: 对test数据进行标签编码...")
     try:
-        user_df['user_id'] = user_le.transform(user_df['user_id'])
-        item_df['item_id'] = item_le.transform(item_df['item_id'])
-        test_inter_df['user_id'] = user_le.transform(test_inter_df['user_id'])
-        test_inter_df['item_id'] = item_le.transform(test_inter_df['item_id'])
-    except ValueError as e:
-        logger.error(f"标签编码失败，test集包含未在训练集中出现的ID: {e}")
-        return
-    # 5. 解析特征字符串
-    logger.info("步骤5: 解析特征字符串...")
-    user_features = [c for c in user_df.columns if c != 'user_id']
-    item_features = [c for c in item_df.columns if c != 'item_id']
-    for col in user_features:
-        user_df[col] = fast_parse_feature_series(user_df[col])
-    for col in item_features:
-        item_df[col] = fast_parse_feature_series(item_df[col])
-    # 6. 加载已保存的 scaler
-    logger.info("步骤6: 加载已保存的 scaler...")
-    scalers_dir = os.path.join(ModelConfig.SLOPE_OR_PT, ModelConfig.SCALER_SAVE_DIR, ModelConfig.SUB_DIR)
-    scalers_path = os.path.join(scalers_dir, "scalers_dict.pkl")
-    if not os.path.exists(scalers_path):
-        logger.error(f"未找到已保存的 scaler 文件: {scalers_path}")
-        return
-    scalers_dict = joblib.load(scalers_path)
-    logger.info("成功加载 scaler")
-    # 7. 应用归一化
-    logger.info("步骤7: 应用特征归一化...")
-    if scalers_dict.get('user'):
-        user_df = batch_normalize_features(user_df, user_features, scalers_dict, 'user')
-    if scalers_dict.get('item'):
-        item_df = batch_normalize_features(item_df, item_features, scalers_dict, 'item')
-    interaction_features = scalers_dict.get('inter_features', [])
-    if interaction_features and scalers_dict.get('inter') is not None:
-        missing_features = set(interaction_features) - set(test_inter_df.columns)
-        if missing_features:
-            logger.warning(f"test数据缺少以下交互特征: {missing_features}")
-            for f in missing_features:
-                test_inter_df[f] = 0.0
-        test_inter_df[interaction_features] = scalers_dict['inter'].transform(test_inter_df[interaction_features])
-        logger.info(f"已归一化 {len(interaction_features)} 个交互特征")
-    else:
-        logger.warning("未找到交互特征 scaler，跳过交互特征归一化")
-    # 8. 创建test数据生成器
-    logger.info("步骤8: 创建test数据生成器...")
-    test_generator = UpdatedDeepCrossingDataGenerator(test_inter_df, user_df, item_df, ModelConfig.EVALUATION_BATCH_SIZE)
-    user_dim, item_dim, inter_dim = test_generator.get_input_dims()
-    logger.info(f"test数据维度 - user: {user_dim}, item: {item_dim}, inter: {inter_dim}")
-    # 9. 加载模型（使用训练好的模型）
-    logger.info("步骤9: 加载已训练模型...")
-    model_name = selected_folder.replace('Q9_n-sh000300-', '')
-    model_save_dir = f"{ModelConfig.SLOPE_OR_PT}/model/{ModelConfig.SUB_DIR}"
-    model_path = f"{model_save_dir}/model_{model_name}.keras"
-    if not os.path.exists(model_path):
-        logger.error(f"未找到模型文件: {model_path}")
-        return
-    try:
-        model = load_model(model_path, custom_objects={'huber_loss': huber_loss})
-        logger.info(f"成功加载模型: {model_path}")
+        # 逻辑：Q9_n-sh000300-2025-1-7-1500 -> 提取 2025-1-7-1500
+        parts = folder_name.split('-')
+        # 1. 提取时间窗口（最后一部分）
+        time_window = parts[-1] 
+        # 2. 提取日期+时间部分（倒数第四部分到最后）
+        date_parts = parts[-4:]
+        datetime_str = "-".join(date_parts)
+        # 3. 验证时间窗口是否在配置列表中 
+        if time_window not in FactoryConfig.TIME_WINDOW_KEYS:
+            raise ValueError(f"时间窗口 {time_window} 不在支持列表 {FactoryConfig.TIME_WINDOW_KEYS} 中")
+        return datetime_str, time_window
     except Exception as e:
-        logger.error(f"加载模型失败: {e}")
-        return
-    # 10. 执行评估
-    logger.info("步骤10: 执行test集评估...")
-    if len(test_generator) > 0:
-        evaluation = model.evaluate(test_generator, verbose=1)
-        logger.info(f"test集评估结果 - Loss: {evaluation[0]:.6f}, MAE: {evaluation[1]:.6f}")
-    else:
-        logger.warning("test数据生成器为空，无法评估")
-        return
-    # 11. 生成预测并可视化
-    logger.info("步骤11: 生成test集预测结果并可视化...")
-    df = evaluate_predictions(test_generator, model, user_le, item_le)
-    if not df.empty:
-        logger.info(f"test集预测完成，共生成 {len(df)} 条结果")
-        print("\n" + "=" * 60)
-        print("test集 - 每个用户 Top-5 预测结果:")
-        print("=" * 60)
-        plot_top_n_predictions(df, n=5)
-    else:
-        logger.warning("test集预测结果为空")
-    # 12. 清理资源
-    logger.info("步骤12: 清理test评估资源...")
-    try:
-        del model, test_generator, user_df, item_df, test_inter_df
-    except Exception:
-        pass
-    gc.collect()
-    keras.backend.clear_session()
-    try:
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    except Exception:
-        pass
-    logger.info("=" * 60)
-    logger.info("test集评估完成 ✅")
-    logger.info("=" * 60)
-    return evaluation, df
-# ======================== 主函数（整合训练+test评估，适配ModelConfig） ========================
-def main():
-    # 加载标签编码器
-    user_le, item_le = load_label_encoders()
-    slopeorpt = ModelConfig.SLOPE_OR_PT
-    # 获取文件夹列表
-    data_paths = get_data_paths()
-    folder_list = [d for d in os.listdir(data_paths["INTER_DATA_DIR"]) if os.path.isdir(os.path.join(data_paths["INTER_DATA_DIR"], d))]
-    if not folder_list:
-        print("No folders found in INTER_DATA_DIR.")
-        sys.exit(1)
-    else:
-        print("Available folders and their indices:")
-        for i, folder in enumerate(folder_list):
-            print(f"{i}: {folder}")
-        selected_folder = folder_list[33]  # 选择文件夹
-        print(f"Selected folder: {selected_folder}")
-    # 逐批次加载交互数据（copy文件夹）
-    for inter_df, total_rows in load_interaction_data(selected_folder=selected_folder):
-        print(f"Total rows: {total_rows}")
-        # 数据预处理（copy文件夹）
-        inter_df, user_df, item_df, user_le, item_le, train_idx, test_idx = preprocess_data_deepcrossing(inter_df)
-        train_df = inter_df.iloc[train_idx]
-        test_df = inter_df.iloc[test_idx]
-        # 创建数据生成器（copy文件夹）
-        train_generator = UpdatedDeepCrossingDataGenerator(train_df, user_df, item_df)
-        val_generator = UpdatedDeepCrossingDataGenerator(test_df, user_df, item_df)
-        # 构建/加载模型（新增MODEL_LOAD逻辑）
-        user_dim, item_dim, inter_dim = train_generator.get_input_dims()
-        model_name = selected_folder.replace('Q9_n-sh000300-', '')
-        model_save_dir = f"{ModelConfig.SLOPE_OR_PT}/model/{ModelConfig.SUB_DIR}"
-        os.makedirs(model_save_dir, exist_ok=True)
-        model_path = f"{model_save_dir}/model_{model_name}.keras"
-        if ModelConfig.MODEL_LOAD:
-            # 检查模型是否存在，存在则加载并重置学习率
-            if os.path.exists(model_path):
-                print(f"MODEL_LOAD=True，加载已有模型: {model_path}")
-                model = load_model(model_path, custom_objects={'huber_loss': huber_loss})
-                # 重置学习率（重新编译模型）
-                if ModelConfig.OPTIMIZER_CHOICE == 1:
-                    optimizer = Adam(
-                        learning_rate=ModelConfig.LEARNING_RATE, 
-                        beta_1=ModelConfig.ADAM_BETA1, 
-                        beta_2=ModelConfig.ADAM_BETA2, 
-                        epsilon=ModelConfig.ADAM_EPSILON
-                    )
-                elif ModelConfig.OPTIMIZER_CHOICE == 2:
-                    optimizer = RMSprop(learning_rate=ModelConfig.LEARNING_RATE)
-                else:
-                    raise ValueError("Invalid optimizer choice")
-                model.compile(optimizer=optimizer, loss=huber_loss, metrics=[MeanAbsoluteError()])
-                print(f"模型学习率已重置为: {ModelConfig.LEARNING_RATE}")
-            else:
-                print(f"MODEL_LOAD=True 但未找到模型 {model_path}，重新构建模型")
-                model = build_model(user_dim, item_dim, inter_dim)
+        logger.error(f"提取文件夹时间失败：{folder_name}, 错误：{e}") 
+        raise
+def get_candidate_files(inter_data_dir: str, time_window: str, inter_feat_df: pd.DataFrame) -> List[str]:
+    """
+    根据 interact_feat.parquet 的 item_id 过滤候选文件：
+    - 直接从文件名字符串截取 ID，确保时间位数（如1500）保持原样
+    """
+    # 1. 确定时间窗口文件夹路径 [cite: 6]
+    time_window_dir = os.path.join(inter_data_dir, "all", time_window)
+    if not os.path.exists(time_window_dir):
+        raise FileNotFoundError(f"时间窗口文件夹不存在：{time_window_dir}")
+    # 2. 获取目录下所有匹配的 parquet 文件 [cite: 7]
+    all_files = glob.glob(os.path.join(time_window_dir, "sxy-sh000300-*.parquet"))
+    if not all_files:
+        raise ValueError(f"时间窗口 {time_window} 下无候选文件：{time_window_dir}")
+    # 3. 提取有效 item_id 集合 [cite: 7]
+    valid_item_ids = set(inter_feat_df["item_id"].unique())
+    # 4. 建立 ID 到文件路径的映射（字符串截取逻辑） 
+    file_map = {}
+    for file_path in all_files:
+        file_name = os.path.basename(file_path).replace(".parquet", "")
+        # 逻辑：sxy-sh000300-2025-1-7-1500 -> 2025-1-7-1500
+        # 取 '-' 分割后的最后四段：年-月-日-时间
+        parts = file_name.split('-')
+        item_id_str = "-".join(parts[-4:]) 
+        file_map[item_id_str] = file_path
+    # 5. 过滤：只保留在 interact_feat 中出现的 item_id 
+    filtered_files = [file_map[item_id] for item_id in valid_item_ids if item_id in file_map]
+    if not filtered_files:
+        # 打印调试信息，方便对比 ID 格式 
+        sample_feat_id = list(valid_item_ids)[0] if valid_item_ids else "None"
+        sample_file_id = list(file_map.keys())[0] if file_map else "None"
+        logger.error(f"匹配失败！interact_feat 样例: {sample_feat_id}, 文件截取样例: {sample_file_id}")
+        raise ValueError("过滤后无有效候选文件，请检查 interact_feat 与文件名的对应关系")
+# 6. 核心修复：将字符串转换为 datetime 对象进行排序
+    def sort_key(file_path):
+        file_name = os.path.basename(file_path).replace(".parquet", "")
+        # 提取日期部分，例如 "2023-10-9-1500"
+        parts = file_name.split('-')
+        item_id_str = "-".join(parts[-4:])
+        # 使用 strptime 解析日期，这样 10-9 会被正确识别为早于 10-23
+        return datetime.strptime(item_id_str, "%Y-%m-%d-%H%M")
+    candidate_files_sorted = sorted(filtered_files, key=sort_key)
+    logger.info(f"找到 {len(candidate_files_sorted)} 个候选文件（已按时间线校准排序）")
+    return candidate_files_sorted
+# =============================================================================
+# 工具函数：候选数据选择方案（3种方案，核心修正Top-K逻辑）
+# =============================================================================
+from collections import defaultdict
+def generate_systematic_groups(candidate_files: List[str], count: int = 50) -> List[List[str]]:
+    """
+    方案1：工作日无限循环提取（直到数据耗尽）
+    规则：
+    1. 识别最老数据对应的星期（起始点） 。
+    2. 按 [起始星期, 起始+1, ..., 周五, 周一, ...] 的顺序循环。
+    3. 每次从当前星期的“文件池”中提取最前的 count 个文件。
+    4. 只要任何一个星期的剩余文件不足 count 个，循环停止。
+    """
+    if not candidate_files:
+        return []
+    # 1. 将所有文件按星期几归类 (0=周一, 4=周五)
+    weekday_pools = defaultdict(list)
+    parsed_data = []
+    for file_path in candidate_files:
+        file_name = os.path.basename(file_path).replace(".parquet", "")
+        parts = file_name.split('-') 
+        # 提取日期部分：sxy-sh000300-2025-1-7-1500 -> 2025-1-7 [cite: 5]
+        date_str = "-".join(parts[-4:-1]) 
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            weekday = dt.weekday()
+            if weekday <= 4:  # 仅保留工作日 [cite: 11]
+                weekday_pools[weekday].append(file_path)
+                parsed_data.append((dt, weekday))
+        except Exception as e:
+            logger.warning(f"解析日期失败 {date_str}: {e}")
+    if not parsed_data:
+        return [] 
+    # 2. 找到最老文件对应的星期几作为起始点 
+    # candidate_files 已按时间排序，取第一个有效解析的文件即可
+    first_dt, start_weekday = min(parsed_data, key=lambda x: x[0])
+    # 3. 准备循环变量
+    groups = []
+    current_weekday = start_weekday
+    # 记录每个星期池已经提取到了第几个索引
+    pool_pointers = defaultdict(int) 
+    weekday_names = ["周一", "周二", "周三", "周四", "周五"]
+    logger.info(f"起始数据星期：{weekday_names[start_weekday]}，开始全量循环提取...")
+    # 4. 开启无限循环提取，直到数据不足
+    while True:
+        # 获取当前星期池
+        pool = weekday_pools[current_weekday]
+        start_idx = pool_pointers[current_weekday]
+        end_idx = start_idx + count
+        # 检查当前星期池是否还有足够数据
+        if end_idx > len(pool):
+            logger.info(f"停止提取：{weekday_names[current_weekday]} 数据已耗尽 (剩余 {len(pool)-start_idx} 条)")
+            break
+        # 提取一组数据
+        group = pool[start_idx:end_idx]
+        groups.append(group)
+        # 更新指针：此步决定是“滑动提取”还是“跳跃提取”
+        # 若要完全不重复提取，使用 pool_pointers[current_weekday] += count
+        # 若要按步长滑动（如每次往后移1天），使用 += 1。这里建议使用 += 1 以获得更多训练样本
+        pool_pointers[current_weekday] += 1 
+        # 移动到下一个工作日 (0->1->2->3->4->0)
+        current_weekday = (current_weekday + 1) % 5
+        # 如果下一个星期完全没数据（比如数据集中根本没周五），也需要跳出避免死循环
+        if not weekday_pools[current_weekday] and any(weekday_pools.values()):
+             # 尝试再找下一个有数据的日子
+             search_count = 0
+             while not weekday_pools[current_weekday] and search_count < 5:
+                 current_weekday = (current_weekday + 1) % 5
+                 search_count += 1
+             if search_count >= 5: break
+    logger.info(f"循环提取完成，共生成 {len(groups)} 组候选数据")
+    return groups
+def generate_sliding_groups(candidate_files: List[str], count: int = 50, step: int = 5) -> List[List[str]]:
+    """
+    方案2：时间滑动窗口（连续50条，步长5）
+    规则：连续选取50条数据，窗口每次后移5条，捕捉时间连续性特征
+    返回：每组50条文件路径的列表
+    """
+    total = len(candidate_files)
+    if total < count:
+        logger.warning(f"滑动窗口候选文件不足（总文件数：{total} < {count}），跳过该方案")
+        return []
+    groups = []
+    for start in range(0, total - count + 1, step):
+        end = start + count
+        group = candidate_files[start:end]
+        groups.append(group)
+    logger.info(f"生成滑动窗口组：{len(groups)} 组")
+    return groups
+def generate_topk_groups(inter_feat_df: pd.DataFrame, candidate_files: List[str], count: int = 50) -> List[List[str]]:
+    """
+    方案3：Top-K相似度（基于字符串截取匹配 ID，确保时间位数一致）
+    规则：特征均值越小越相似，分3组（最相似/中间/最不相似），每组50条 [cite: 13]
+    """
+    total_candidates = len(candidate_files)
+    if total_candidates < count * 3:
+        logger.warning(f"Top-K候选文件不足（总文件数：{total_candidates} < {count*3}），跳过该方案")
+        return []
+    # 1. 筛选相似性特征列 [cite: 13]
+    similar_feat_cols = [col for col in inter_feat_df.columns if 'NC-n' in col or 'nad-n' in col]
+    if not similar_feat_cols:
+        raise ValueError("interact_feat.parquet中未找到11NC-n/13NC-n等相似性特征列") 
+    logger.info(f"Top-K排序使用 {len(similar_feat_cols)} 个相似性特征")
+    # 2. 计算每条候选数据的特征均值并排序（均值越小越相似） 
+    inter_feat_df['similarity_mean'] = inter_feat_df[similar_feat_cols].mean(axis=1)
+    inter_feat_sorted = inter_feat_df.sort_values('similarity_mean', ascending=True).reset_index(drop=True)
+    # 3. 建立 item_id 到文件路径的映射（关键修复：使用字符串截取逻辑） [cite: 8, 22]
+    item_id_to_file = {}
+    for file_path in candidate_files:
+        file_name = os.path.basename(file_path).replace(".parquet", "")
+        # 逻辑：sxy-sh000300-2025-1-7-1500 -> 提取 2025-1-7-1500
+        # 直接截取最后 4 段，确保像 1500 这样的字符串不会因转化为数字而丢失末尾的 0 [cite: 8, 22]
+        parts = file_name.split('-')
+        item_id_str = "-".join(parts[-4:]) 
+        item_id_to_file[item_id_str] = file_path
+    # 4. 生成排序后的有效文件路径列表 [cite: 15]
+    sorted_files = []
+    for _, row in inter_feat_sorted.iterrows():
+        item_id_str = row['item_id']
+        if item_id_str in item_id_to_file:
+            sorted_files.append(item_id_to_file[item_id_str])
         else:
-            # 不加载，重新构建模型
-            print("MODEL_LOAD=False，重新构建模型")
-            model = build_model(user_dim, item_dim, inter_dim)
-        csv_log_path = os.path.join(slopeorpt, f"training_log_mode{model_name}.csv")
-        run_id = int(pd.Timestamp.now().timestamp())
-        # 训练模型（copy文件夹）
-        model, history = train_model(model, train_generator, val_generator, user_le, item_le, 
-                csv_log_path=csv_log_path, run_id=run_id)
-        # 根据参数保存训练历史
-        if ModelConfig.SAVE_PREDICTION_HISTORY:
-            history_df = pd.DataFrame(history.history)
-            history_df.to_csv(f'{ModelConfig.SLOPE_OR_PT}/training_history_{model_name}.csv', index=False)
-        # 保存模型
+            # 如果依然匹配不到，这里可以方便地打印出尝试匹配的 ID 格式进行调试
+            logger.debug(f"未找到匹配项: {item_id_str}") 
+    # 5. 确保有效文件数满足分组需求 [cite: 15, 16]
+    if len(sorted_files) < count * 3:
+        logger.warning(f"Top-K有效匹配文件不足（有效数：{len(sorted_files)} < {count*3}）")
+        return []
+    # 6. 分3组：最相似（均值小）、中间、最不相似（均值大） [cite: 16]
+    groups = [
+        sorted_files[:count],  # Top-K最小（最相似） [cite: 16]
+        sorted_files[len(sorted_files)//2 - count//2 : len(sorted_files)//2 + count//2],  # 中间组 [cite: 16]
+        sorted_files[-count:]  # Top-K最大（最不相似） [cite: 16]
+    ]
+    logger.info(f"成功生成Top-K组：3组，匹配成功数：{len(sorted_files)}")
+    return groups
+def generate_all_candidate_groups(inter_feat_df: pd.DataFrame, candidate_files: List[str]) -> Dict[str, List[List[str]]]:
+    """
+    生成所有3种方案的候选组，过滤空组
+    返回：{方案名: 组列表}
+    """
+    groups = {
+        "systematic": generate_systematic_groups(candidate_files, FactoryConfig.CANDIDATE_COUNT),
+        "sliding": generate_sliding_groups(candidate_files, FactoryConfig.CANDIDATE_COUNT),
+        "topk": generate_topk_groups(inter_feat_df, candidate_files, FactoryConfig.CANDIDATE_COUNT)
+    }
+    # 过滤空组（仅保留有有效组的方案）
+    groups = {k: v for k, v in groups.items() if v}
+    total_groups = sum(len(v) for v in groups.values())
+    logger.info(f"最终生成有效候选组：{total_groups} 组（方案：{list(groups.keys())}）")
+    return groups
+# =============================================================================
+# 工具函数：断点续跑（避免重复处理）
+# =============================================================================
+def init_index_csv():
+    """初始化评估结果索引CSV（若不存在）"""
+    os.makedirs(FactoryConfig.FACTORY_CACHE_DIR, exist_ok=True)
+    if not os.path.exists(FactoryConfig.INDEX_CSV_PATH):
+        # 索引文件字段：文件夹名、方案类型、组编号、特征路径、各项评估指标、时间戳
+        df = pd.DataFrame(columns=[
+            "selected_folder", "scheme", "group_id", "feature_path",
+            "test_loss", "precision@5", "penalty@5", "comprehensive_score", "timestamp"
+        ])
+        df.to_csv(FactoryConfig.INDEX_CSV_PATH, index=False)
+        logger.info(f"初始化索引文件：{FactoryConfig.INDEX_CSV_PATH}")
+def is_group_processed(selected_folder: str, scheme: str, group_id: int) -> bool:
+    """检查组是否已处理（通过索引CSV判断）"""
+    if not os.path.exists(FactoryConfig.INDEX_CSV_PATH):
+        return False
+    df = pd.read_csv(FactoryConfig.INDEX_CSV_PATH)
+    mask = (
+        (df["selected_folder"] == selected_folder) &
+        (df["scheme"] == scheme) &
+        (df["group_id"] == group_id)
+    )
+    return mask.any()
+def write_to_index(selected_folder: str, scheme: str, group_id: int, feature_path: str,
+                  test_loss: float, precision5: float, penalty5: float, comprehensive_score: float):
+    """将组的评估结果写入索引CSV"""
+    init_index_csv()
+    # 构造新记录
+    new_row = pd.DataFrame({
+        "selected_folder": [selected_folder],
+        "scheme": [scheme],
+        "group_id": [group_id],
+        "feature_path": [feature_path],
+        "test_loss": [round(test_loss, 6)],
+        "precision@5": [round(precision5, 6)],
+        "penalty@5": [round(penalty5, 6)],
+        "comprehensive_score": [round(comprehensive_score, 6)],
+        "timestamp": [pd.Timestamp.now().isoformat()]
+    })
+    # 追加写入CSV
+    new_row.to_csv(FactoryConfig.INDEX_CSV_PATH, mode="a", header=False, index=False)
+    logger.info(f"已记录组 {scheme}-{group_id} 到索引：综合得分 {comprehensive_score:.4f}")
+# =============================================================================
+# 工具函数：聚合特征提取与存储（51条×333列：item_id + 332维特征）
+# =============================================================================
+def extract_agg_features(selected_folder_path: str, candidate_group: List[str], 
+                        scheme: str, datetime_str: str) -> pd.DataFrame:
+    """
+    提取51条数据（1条全量+50条候选），保持 item_id 位数一致性 
+    返回：333列DataFrame（item_id + 332维特征）
+    """
+    # 1. 读取该文件夹的聚合特征文件 
+    agg_feat_file = os.path.join(selected_folder_path, f"inter_feat_{datetime_str}.parquet")
+    if not os.path.exists(agg_feat_file):
+        raise FileNotFoundError(f"聚合特征文件不存在：{agg_feat_file}")
+    agg_df = pd.read_parquet(agg_feat_file)
+    agg_df = agg_df.rename(columns={"id": "item_id"})  # 统一列名 
+    # 2. 提取候选组中每个文件的原始 item_id 字符串 [cite: 21]
+    candidate_item_ids = []
+    for file_path in candidate_group:
+        file_name = os.path.basename(file_path).replace(".parquet", "")
+        # 同样使用字符串截取逻辑，确保 1500 不会变成 150 [cite: 21]
+        parts = file_name.split('-')
+        item_id_str = "-".join(parts[-4:])
+        candidate_item_ids.append(item_id_str)
+    # 3. 匹配特征数据 [cite: 21, 22]
+    candidate_items = []
+    for item_id in candidate_item_ids:
+        mask = agg_df["item_id"] == item_id
+        if mask.any():
+            row = agg_df[mask].iloc[0]
+            item_id_val = row["item_id"]
+            feat_row = row.drop("item_id").values.astype(np.float32) 
+        else:
+            logger.warning(f"聚合特征中未找到 item_id {item_id}，全零填充")
+            item_id_val = item_id
+            feat_row = np.zeros(329, dtype=np.float32)
+        candidate_items.append((item_id_val, feat_row))
+    # 4. 提取第1行作为全量数据 [cite: 23]
+    total_row = agg_df.iloc[0]
+    total_item_id = total_row["item_id"]
+    total_feat = total_row.drop("item_id").values.astype(np.float32) 
+    # 5. 组合并添加 One-Hot 辅助特征 [cite: 23, 24]
+    one_hot = FactoryConfig.ONE_HOT_MAP[scheme]
+    all_data = [(total_item_id, total_feat)] + candidate_items
+    final_rows = []
+    for item_id_val, core_feat in all_data:
+        feat_with_aux = np.concatenate([core_feat, one_hot])  # 329+3=332维 [cite: 24]
+        final_rows.append([item_id_val] + feat_with_aux.tolist())
+    # 6. 构造最终 DataFrame [cite: 24]
+    columns = ["item_id"] + [f"feat_{i}" for i in range(332)]
+    feat_df = pd.DataFrame(final_rows, columns=columns)
+    logger.info(f"聚合特征提取完成：{len(feat_df)}行，ID格式样例：{feat_df['item_id'].iloc[0]}")
+    return feat_df
+def save_agg_features(feat_df: pd.DataFrame, selected_folder: str, scheme: str, group_id: int) -> str:
+    """保存归一化后的聚合特征到 factory_cache"""
+    feat_df = normalize_factory_features(feat_df)
+    file_name = f"{selected_folder}_{scheme}_{group_id}_set.parquet"
+    save_path = os.path.join(FactoryConfig.FACTORY_CACHE_DIR, file_name)
+    feat_df.to_parquet(save_path, index=False, compression="snappy")
+    logger.info(f"归一化后的聚合特征保存路径：{save_path}")
+    return save_path
+# =============================================================================
+# 工具函数：评估指标计算（Precision@5 + Over-prediction Penalty）
+# =============================================================================
+
+def calculate_prediction_penalty(top_k_df: pd.DataFrame) -> float:
+    """
+    计算惩罚性指标：当真实评分低于预测评分时，计算其差值的平均数。
+    仅针对 Top-k 数据进行计算。
+    """
+    # 计算差值 (预测 - 真实)，只保留预测更高的部分（即差值 > 0）
+    diff = top_k_df["prediction"] - top_k_df["true_rating"]
+    penalty_values = diff[diff > 0]
+    
+    if penalty_values.empty:
+        return 0.0
+    return penalty_values.mean()
+
+def calculate_precision_and_penalty(pred_df: pd.DataFrame, k=5, precision_threshold=9.0) -> Tuple[float, float]:
+    """
+    计算 Precision@k 和 Top-k 预测惩罚项。
+    - Precision@k：Top-k 预测中，true_rating >= threshold 的占比。
+    - Penalty：Top-k 中，(预测分 - 真实分) 的平均值（仅当预测 > 真实时计算）。
+    """
+    precision_list = []
+    penalty_list = []
+    
+    for user_id, group in pred_df.groupby("user_id"):
+        # 按预测分降序选 Top-k
+        group_sorted = group.sort_values("prediction", ascending=False).head(k)
+        
+        # 1. 计算 Precision
+        hits = (group_sorted["true_rating"] >= precision_threshold).sum()
+        precision_list.append(hits / k if k > 0 else 0.0)
+        
+        # 2. 计算惩罚项 (Top-5 差值平均)
+        penalty = calculate_prediction_penalty(group_sorted)
+        penalty_list.append(penalty)
+        
+    avg_precision = np.mean(precision_list) if precision_list else 0.0
+    avg_penalty = np.mean(penalty_list) if penalty_list else 0.0
+    
+    logger.info(f"Precision@{k}: {avg_precision:.4f}, Prediction Penalty: {avg_penalty:.4f}")
+    return avg_precision, avg_penalty
+# =============================================================================
+# 工具函数：候选数据硬链接到copy文件夹（避免复制大文件）
+# =============================================================================
+def link_candidate_to_copy(candidate_group: List[str], copy_folder: str):
+    """
+    将候选组的文件硬链接到selected_folder的copy文件夹（训练集目录）
+    先清空原有文件，再创建硬链接（节省磁盘空间）
+    """
+    # 清空copy文件夹
+    if os.path.exists(copy_folder):
+        for file in glob.glob(os.path.join(copy_folder, "*.parquet")):
+            os.remove(file)
+            logger.debug(f"删除旧链接：{os.path.basename(file)}")
+    else:
+        os.makedirs(copy_folder, exist_ok=True)
+    # 为候选组中每个文件创建硬链接
+    for src_file in candidate_group:
+        dst_file = os.path.join(copy_folder, os.path.basename(src_file))
+        if not os.path.exists(dst_file):
+            os.link(src_file, dst_file)  # 硬链接（仅创建引用，不复制数据）
+    logger.info(f"已创建 {len(candidate_group)} 个硬链接到训练集目录：{copy_folder}")
+# =============================================================================
+# 核心函数：单组候选数据的训练、评估与特征存储
+# =============================================================================
+def process_single_group(selected_folder_path: str, selected_folder_name: str,
+                        candidate_group: List[str], scheme: str, group_id: int,
+                        datetime_str: str, time_window: str) -> Tuple[float, float, float, float]:
+    """
+    处理单组候选数据的完整流程（适配代码1逻辑）：
+    1. 硬链接 -> 2. 数据预处理 -> 3. 模型训练 -> 4. 保存模型 -> 5. 评估测试集
+    """
+    # 1. 硬链接候选数据到训练集目录
+    copy_folder = os.path.join(selected_folder_path, "copy")
+    link_candidate_to_copy(candidate_group, copy_folder)
+
+    # 2. 环境准备
+    slopeorpt = ModelConfig.SLOPE_OR_PT
+    sub_dir = ModelConfig.SUB_DIR
+    user_le, item_le = load_or_fit_label_encoders(slopeorpt, sub_dir)
+    
+    # 3. 数据加载
+    train_inter_df = concat_parquet_files(copy_folder, files_per_batch=ModelConfig.FILES_PER_BATCH)
+    if train_inter_df.empty:
+        raise ValueError("训练集为空")
+
+    # 4. 数据预处理
+    inter_df, user_df, item_df, user_le, item_le, train_idx, test_idx = preprocess_data_deepcrossing(
+        train_inter_df, slopeorpt, sub_dir
+    )
+
+    # 5. 构建生成器
+    train_df = inter_df.iloc[train_idx]
+    val_df = inter_df.iloc[test_idx] 
+    train_generator = UpdatedDeepCrossingDataGenerator(train_df, user_df, item_df)
+    val_generator = UpdatedDeepCrossingDataGenerator(val_df, user_df, item_df, batch_size=ModelConfig.EVALUATION_BATCH_SIZE)
+    
+    user_dim, item_dim, inter_dim = train_generator.get_input_dims()
+
+    # ======================== 模型加载/构建逻辑 ========================
+    model_name_tag = selected_folder_name.replace('Q9_n-sh000300-', '')
+    model_save_dir = os.path.join(slopeorpt, "model", sub_dir)
+    os.makedirs(model_save_dir, exist_ok=True)
+    model_path = os.path.join(model_save_dir, f"model_{model_name_tag}.keras")
+
+    if ModelConfig.MODEL_LOAD and os.path.exists(model_path):
+        logger.info(f"正在加载预训练模型: {model_path}")
+        model = load_model(model_path, custom_objects={'huber_loss': huber_loss})
+        model.optimizer.learning_rate = ModelConfig.LEARNING_RATE
+    else:
+        if ModelConfig.MODEL_LOAD:
+            logger.warning(f"未找到可加载模型 {model_path}，将构建新模型")
+        model = build_model(user_dim, item_dim, inter_dim)
+        logger.info("已构建新模型")
+    # ======================================================================
+
+    # 6. 训练模型
+    csv_log_path = os.path.join(FactoryConfig.FACTORY_CACHE_DIR, f"train_log_{selected_folder_name}_{scheme}_{group_id}.csv")
+    run_id = int(pd.Timestamp.now().timestamp())
+    
+    model, history = train_model(
+        model, train_generator, val_generator, user_le, item_le,
+        csv_log_path=csv_log_path, 
+        run_id=run_id
+    )
+
+    # ======================== 关键修正：先保存模型！ ========================
+    # 必须先保存，evaluate_test_folder 才能加载到刚才训练好的模型
+    try:
         model.save(model_path)
-        print(f"Model saved to: {model_path}")
-        # 评估copy文件夹的测试集（原有逻辑）
-        evaluation = model.evaluate(val_generator, batch_size=ModelConfig.EVALUATION_BATCH_SIZE)
-        print(f'Test Loss (copy folder): {evaluation}')
-        # 生成copy文件夹的评估报告
-        df = evaluate_predictions(val_generator, model, user_le, item_le)
-        plot_top_n_predictions(df)
-        # 评估test文件夹数据（新增逻辑）
-        evaluate_test_folder(selected_folder)
-        # 清理显存
-        import gc
-        from keras import backend as K
-        del model, train_generator, val_generator, history, df
+        logger.info(f"模型已保存至: {model_path}")
+    except Exception as e:
+        logger.error(f"模型保存失败: {e}")
+    # ======================================================================
+
+    # 7. 核心修改：评估 test 文件夹
+    # 此时加载的才是刚才训练保存的最新模型
+    test_evaluation, pred_df = evaluate_test_folder(selected_folder_name)
+    
+    # 8. 计算指标
+    test_loss = test_evaluation[0] if test_evaluation else 999.0
+    precision5, penalty = calculate_precision_and_penalty(pred_df, k=5)
+    
+    loss_component = 1.0 / (1.0 + test_loss)
+    comprehensive_score = (0.3 * loss_component + 0.5 * precision5 - 0.2 * penalty)
+
+    # 9. 特征提取与索引记录
+    feat_df = extract_agg_features(selected_folder_path, candidate_group, scheme, datetime_str)
+    feature_path = save_agg_features(feat_df, selected_folder_name, scheme, group_id)
+    write_to_index(selected_folder_name, scheme, group_id, feature_path, test_loss, precision5, penalty, comprehensive_score)
+
+    # 10. 资源清理
+    try:
+        del model, train_generator, val_generator, history, pred_df, train_df, inter_df
         gc.collect()
-        K.clear_session()
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        print("显存已清理完毕 ✅")
+        keras.backend.clear_session()
+        logger.info("资源清理完成")
+    except Exception as e:
+        logger.warning(f"资源清理异常: {e}")
+
+    return test_loss, precision5, penalty, comprehensive_score
+# =============================================================================
+# 主流程：遍历所有候选组，断点续跑处理
+# =============================================================================
+def main():
+    try:
+        # 1. 初始化索引文件
+        init_index_csv()
+        # 2. 获取数据根路径和 selected_folder 列表
+        slopeorpt = ModelConfig.SLOPE_OR_PT
+        sub_dir = ModelConfig.SUB_DIR
+        data_paths = get_data_paths(slopeorpt, sub_dir)
+        inter_data_dir = data_paths["INTER_DATA_DIR"]
+        logger.info(f"交互数据根目录：{inter_data_dir}")
+        folder_list = [d for d in os.listdir(inter_data_dir) if os.path.isdir(os.path.join(inter_data_dir, d))]
+        # 3. 循环处理多个索引
+        for folder_index in FactoryConfig.SELECTED_FOLDER_INDEXES:
+            if len(folder_list) <= folder_index:
+                logger.warning(f"索引 {folder_index} 超出范围（总共有 {len(folder_list)} 个 selected_folder）")
+                continue
+            selected_folder_name = folder_list[folder_index]
+            selected_folder_path = os.path.join(inter_data_dir, selected_folder_name)
+            logger.info(f"\n{'='*80}")
+            logger.info(f"当前处理 selected_folder：{selected_folder_name}")
+            logger.info(f"文件夹路径：{selected_folder_path}")
+            logger.info(f"{'='*80}\n")
+            try:
+                # 4. 提取时间信息
+                datetime_str, time_window = extract_folder_datetime(selected_folder_name)
+                logger.info(f"提取到时间窗口：{time_window}，datetime_str：{datetime_str}")
+                # 5. 读取 interact_feat.parquet
+                interact_feat_path = os.path.join(selected_folder_path, "interact_feat.parquet")
+                if not os.path.exists(interact_feat_path):
+                    logger.error(f"交互特征文件不存在：{interact_feat_path}")
+                    continue
+                inter_feat_df = pd.read_parquet(interact_feat_path)
+                logger.info(f"加载 interact_feat.parquet：{len(inter_feat_df)} 条交互特征数据")
+                # 6. 获取候选文件（基于 inter_feat_df 过滤）
+                candidate_files = get_candidate_files(inter_data_dir, time_window, inter_feat_df)
+                # 7. 生成所有候选组
+                candidate_groups = generate_all_candidate_groups(inter_feat_df, candidate_files)
+                if not candidate_groups:
+                    logger.error("无有效候选组，跳过该文件夹")
+                    continue
+                total_groups = sum(len(groups) for groups in candidate_groups.values())
+                logger.info(f"\n开始处理所有候选组（总计：{total_groups} 组）")
+                # 8. 遍历所有组
+                for scheme, groups in candidate_groups.items():
+                    for group_id, candidate_group in enumerate(groups):
+                        if is_group_processed(selected_folder_name, scheme, group_id):
+                            logger.info(f"组 {scheme}-{group_id} 已处理，跳过")
+                            continue
+                        process_single_group(
+                            selected_folder_path, selected_folder_name,
+                            candidate_group, scheme, group_id,
+                            datetime_str, time_window
+                        )
+            except Exception as e:
+                logger.error(f"处理文件夹 {selected_folder_name} 失败：{e}")
+                continue
+        logger.info("所有组处理完成！")
+    except Exception as e:
+        logger.error(f"程序执行失败：{e}")
 if __name__ == "__main__":
     main()
